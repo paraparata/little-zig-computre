@@ -162,10 +162,12 @@ pub fn operate(self: Self, comptime pc_start: u16) !void {
     self.writeReg(Flags, .COND, .ZRO);
     self.writeReg(u16, .PC, pc_start);
 
+    var running = true;
     while (true) {
         const address = self.readReg(.PC) + 1;
         const instr = try self.readMem(address);
         const op: Op = @enumFromInt(instr >> 12);
+        var bw = io.bufferedWriter(self.writer);
 
         switch (op) {
             .ADD => {
@@ -275,35 +277,58 @@ pub fn operate(self: Self, comptime pc_start: u16) !void {
                 const offset = signExtend(instr & 0x3F, 6);
                 try self.writeMem(self.readReg(r1) + offset, self.readReg(r0));
             },
-            .TRAP => self.handleTrap(instr),
+            .TRAP => {
+                self.writeReg(u16, .R7, self.readReg(.PC));
+                const routine: TrapRoutine = @enumFromInt(instr & 0xFF);
+
+                switch (routine) {
+                    .GETC => {
+                        const c = try self.reader.readInt(u16, .little);
+                        self.writeReg(u16, .R0, c);
+                        self.updateFlags(.R0);
+                    },
+                    .OUT => {
+                        const c: u8 = @truncate(self.readReg(.R0));
+                        try bw.writer().writeInt(u8, c, .little);
+                        try bw.flush();
+                    },
+                    .PUTS => {
+                        var start = self.readReg(.R0);
+                        const c = try self.readMem(start);
+                        while (c != 0) : (start += 1) {
+                            try bw.writer().writeByte(@as(u8, @truncate(c)));
+                        }
+                        bw.flush();
+                    },
+                    .IN => {
+                        try bw.writer().print("Enter a character: ", .{});
+
+                        var br = io.bufferedReader(self.reader);
+                        const c = try br.reader().readByte();
+                        try bw.writer().writeByte(c);
+                        try bw.flush();
+
+                        self.writeReg(u16, .R0, @as(u16, c));
+                        self.updateFlags(.R0);
+                    },
+                    .PUTSP => {
+                        // TODO: Understand more about this
+                        var start = self.readReg(.R0);
+                        const c = try self.readMem(start);
+                        while (c != 0) : (start += 1) {
+                            try bw.writer().writeInt(u8, @truncate(c), .big);
+                        }
+                        bw.flush();
+                    },
+                    .HALT => {
+                        try bw.writer().writeAll("HALT");
+                        try bw.flush();
+                        running = false;
+                    },
+                }
+            },
             .RTI, .RES => {},
         }
-    }
-}
-
-fn handleTrap(self: Self, instr: u16) !void {
-    self.writeReg(u16, .R7, self.readReg(.PC));
-    const routine: TrapRoutine = @enumFromInt(instr & 0xFF);
-
-    switch (routine) {
-        .GETC => {
-            const c = try self.reader.readInt(u16, .little);
-            self.writeReg(u16, .R0, c);
-            self.updateFlags(.R0);
-        },
-        .OUT => {},
-        .PUTS => {
-            var address = self.readReg(.R0);
-            const c = try self.readMem(address);
-            var bw = io.bufferedWriter(self.writer);
-            while (c != 0) : (address += 1) {
-                try bw.writer().writeByte(@as(u8, @truncate(c)));
-            }
-            bw.flush();
-        },
-        .IN => {},
-        .PUTSP => {},
-        .HALT => {},
     }
 }
 
