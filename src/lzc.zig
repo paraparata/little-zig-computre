@@ -2,13 +2,14 @@ const Self = @This();
 
 const MEMORY_MAX = 1 << 16;
 const REG_MAX = 10;
+const PC_START = 0x3000;
 
 memory: [MEMORY_MAX]u16,
 reg: [REG_MAX]u16,
 reader: std.io.AnyReader,
 writer: std.io.AnyWriter,
 
-pub const Register = enum(u16) {
+const Register = enum(u16) {
     R0,
     R1,
     R2,
@@ -24,13 +25,13 @@ pub const Register = enum(u16) {
 };
 
 /// Conditional Flags
-pub const Flags = enum(u16) {
+const Flags = enum(u16) {
     POS = 1 << 0,
     ZRO = 1 << 1,
     NEG = 1 << 2,
 };
 
-pub const Opcodes = enum(u16) {
+const Opcodes = enum(u16) {
     /// branch
     BR,
     /// add
@@ -95,15 +96,15 @@ extern fn disable_input_buffering() c_int;
 extern fn restore_input_buffering() void;
 extern fn check_key() c_int;
 
-pub fn readMem(self: Self, address: u16) !u16 {
+fn readMem(self: *Self, address: u16) !u16 {
     if (address >= self.memory.len) {
         return error.OutOfBound;
     }
 
     if (address == @intFromEnum(MemReg.KBSR)) {
         if (check_key() != 0) {
-            self.writeMem(@intFromEnum(MemReg.KBSR), 1 << 15);
-            self.writeMem(@intFromEnum(MemReg.KBDR), blk: {
+            try self.writeMem(@intFromEnum(MemReg.KBSR), 1 << 15);
+            try self.writeMem(@intFromEnum(MemReg.KBDR), blk: {
                 // The original C code uses getchar().
                 // From the getchar man page, if successful the routine
                 // (getchar) will return an unsigned char converted
@@ -115,20 +116,20 @@ pub fn readMem(self: Self, address: u16) !u16 {
                 };
             });
         } else {
-            self.writeMem(@intFromEnum(MemReg.KBSR), 0);
+            try self.writeMem(@intFromEnum(MemReg.KBSR), 0);
         }
     }
     return self.memory[address];
 }
 
-pub fn writeMem(self: *Self, address: u16, val: u16) !void {
+fn writeMem(self: *Self, address: u16, val: u16) !void {
     if (address >= self.memory.len) {
         return error.OutOfBound;
     }
     self.memory[address] = val;
 }
 
-pub fn writeReg(self: *Self, comptime T: type, kind: Register, val: T) void {
+fn writeReg(self: *Self, comptime T: type, kind: Register, val: T) void {
     switch (@typeInfo(T)) {
         .@"enum" => {
             self.reg[@intFromEnum(kind)] = @intFromEnum(val);
@@ -140,34 +141,92 @@ pub fn writeReg(self: *Self, comptime T: type, kind: Register, val: T) void {
     }
 }
 
-pub fn readReg(self: Self, kind: Register) u16 {
+fn readReg(self: Self, kind: Register) u16 {
     return self.reg[@intFromEnum(kind)];
 }
 
-pub fn updateFlags(self: *Self, r: Register) !void {
-    switch (self.readReg(r)) {
-        0 => self.writeReg(Flags, .COND, .ZRO),
-        blk: {
-            const shifted = self.reg[r] >> 15;
-            break :blk shifted;
-        } => self.writeReg(Flags, .COND, .NEG),
-        else => self.writeReg(Flags, .COND, .POS),
+fn updateFlags(self: *Self, r: Register) void {
+    if (self.readReg(r) == 0) {
+        self.writeReg(Flags, .COND, .ZRO);
+        return;
+    }
+
+    const shifted = self.reg[@intFromEnum(r)] >> 15;
+    if (self.readReg(r) == shifted) {
+        self.writeReg(Flags, .COND, .NEG);
+    } else {
+        self.writeReg(Flags, .COND, .POS);
+    }
+
+    // switch (self.readReg(r)) {
+    //     0 => self.writeReg(Flags, .COND, .ZRO),
+    //     blk: {
+    //         const shifted = self.reg[@intFromEnum(r)] >> 15;
+    //         break :blk shifted;
+    //     } => self.writeReg(Flags, .COND, .NEG),
+    //     else => self.writeReg(Flags, .COND, .POS),
+    // }
+}
+
+fn readImageFile(self: *Self, file: std.fs.File) !void {
+    const read2Bytes = try file.reader().readBytesNoEof(2);
+    const origin = std.mem.readInt(u16, &read2Bytes, .little);
+
+    var start = origin;
+    while (true) : (start += 1) {
+        const item = file.reader().readBytesNoEof(2) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        try self.writeMem(start, std.mem.readInt(u16, &item, .little));
     }
 }
 
-pub fn operate(self: Self, comptime pc_start: u16) !void {
+test "read file and swap16" {
+    const file = try std.fs.cwd().openFile("hello.txt", .{});
+    // h = 104 | 0x68
+    // e = 101 | 0x65
+    const read2Bytes = try file.reader().readBytesNoEof(2);
+    try testing.expectEqual('h', read2Bytes[0]);
+    try testing.expectEqualStrings("he", &read2Bytes);
+
+    // 0x68 0x65 -> 0x6568
+    const origin = std.mem.readInt(u16, &read2Bytes, .little);
+    try testing.expectEqual(0x6568, origin);
+
+    var buffer: [3]u16 = undefined;
+    var start: usize = 0;
+    while (true) : (start += 1) {
+        const item = file.reader().readBytesNoEof(2) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        buffer[start] = std.mem.readInt(u16, &item, .little);
+    }
+    // [l ,l] -> [0x6c, 0x6c]([2]u8) -> 0x6c6c(u16.little-endian)
+    try testing.expectEqual(0x6c6c, buffer[0]);
+    // [0 ,`lf`(line feed)] -> [0x6f, 0xa]([2]u8) -> 0xa6f(u16.little-endian)
+    try testing.expectEqual(0xa6f, buffer[1]);
+}
+
+pub fn run(self: *Self, image: std.fs.File) !void {
     const Op = Opcodes;
-    // const Reg = Register;
+    var bw = io.bufferedWriter(self.writer);
+    try bw.writer().print("\x1B[2J\x1B[H", .{});
+
+    try self.readImageFile(image);
+
+    // signal(SIGINT, handle_interrupt);
+    // disable_input_buffering();
 
     self.writeReg(Flags, .COND, .ZRO);
-    self.writeReg(u16, .PC, pc_start);
+    self.writeReg(u16, .PC, PC_START);
 
     var running = true;
-    while (true) {
+    while (running) {
         const address = self.readReg(.PC) + 1;
         const instr = try self.readMem(address);
         const op: Op = @enumFromInt(instr >> 12);
-        var bw = io.bufferedWriter(self.writer);
 
         switch (op) {
             .ADD => {
@@ -179,26 +238,26 @@ pub fn operate(self: Self, comptime pc_start: u16) !void {
                 const r1 = enint((instr >> 6) & 0x7);
                 // Immediate mode flag: marked as 1 bit
                 const imm_flag = (instr >> 5) & 0x1;
-                if (imm_flag) {
+                if (imm_flag != 0) {
                     const imm5 = signExtend(instr & 0x1F, 5);
-                    self.writeReg(r0, @addWithOverflow(self.readReg(r1), imm5)[0]);
+                    self.writeReg(u16, r0, @addWithOverflow(self.readReg(r1), imm5)[0]);
                 } else {
                     const r2 = enint(instr & 0x7);
-                    self.writeReg(r0, @addWithOverflow(self.readReg(r1), self.readReg(r2))[0]);
+                    self.writeReg(u16, r0, @addWithOverflow(self.readReg(r1), self.readReg(r2))[0]);
                 }
                 self.updateFlags(r0);
             },
             .AND => {
                 const r0 = enint((instr >> 9) & 0x07);
                 const r1 = enint((instr >> 6) & 0x07);
-                const imm_flag = enint((instr >> 5) & 0x01);
+                const imm_flag: u16 = (instr >> 5) & 0x01;
 
-                if (imm_flag) {
+                if (imm_flag != 0) {
                     const imm5 = signExtend(instr & 0x1F, 5);
-                    self.writeReg(r0, self.readReg(r1) & imm5);
+                    self.writeReg(u16, r0, self.readReg(r1) & imm5);
                 } else {
                     const r2 = enint(instr & 0x7);
-                    self.writeReg(r0, self.readReg(r1) & self.readReg(r2));
+                    self.writeReg(u16, r0, self.readReg(r1) & self.readReg(r2));
                 }
                 self.updateFlags(r0);
             },
@@ -298,7 +357,7 @@ pub fn operate(self: Self, comptime pc_start: u16) !void {
                         while (c != 0) : (start += 1) {
                             try bw.writer().writeByte(@as(u8, @truncate(c)));
                         }
-                        bw.flush();
+                        try bw.flush();
                     },
                     .IN => {
                         try bw.writer().print("Enter a character: ", .{});
@@ -318,7 +377,7 @@ pub fn operate(self: Self, comptime pc_start: u16) !void {
                         while (c != 0) : (start += 1) {
                             try bw.writer().writeInt(u8, @truncate(c), .big);
                         }
-                        bw.flush();
+                        try bw.flush();
                     },
                     .HALT => {
                         try bw.writer().writeAll("HALT");
@@ -329,7 +388,11 @@ pub fn operate(self: Self, comptime pc_start: u16) !void {
             },
             .RTI, .RES => {},
         }
+
+        try bw.flush();
     }
+
+    // restore_input_buffering();
 }
 
 test "initiation" {
@@ -350,7 +413,7 @@ test "initiation" {
     try testing.expectEqual(0x22, @intFromEnum(TrapRoutine.PUTS));
 }
 
-pub fn signExtend(x: u16, comptime bit_count: usize) u16 {
+fn signExtend(x: u16, comptime bit_count: usize) u16 {
     if (((x >> (bit_count - 1)) & 1) != 0) {
         const ff: u16 = 0xFFFF;
         return x | (ff << bit_count);
